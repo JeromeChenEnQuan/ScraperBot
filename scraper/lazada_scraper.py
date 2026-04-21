@@ -1,18 +1,36 @@
 """
 lazada_scraper.py – Playwright-based Lazada scraper.
 
-Responsibilities:
-  1. Log in to Lazada.
-  2. Search for each query from config.
-  3. Apply price filters and sort order.
-  4. Collect up to MAX_ITEMS_PER_QUERY listings.
-  5. Add each listing to the cart.
-  6. Return structured results for the Telegram bot to report.
+Authentication model
+--------------------
+The bot never handles credentials. Instead:
+
+  1. Run `python main.py --login` once.
+     A visible browser opens on the Lazada homepage. Log in normally
+     (password, OTP, CAPTCHA — whatever Lazada presents). The bot
+     detects when you're signed in and saves the session to
+     AUTH_STATE_FILE (default: auth_state.json).
+
+  2. On every subsequent run the scraper loads that saved state into
+     a fresh browser context, inheriting your cookies and localStorage.
+     If the session has expired the bot will send a Telegram alert
+     asking you to re-run --login.
+
+Responsibilities (normal run)
+------------------------------
+  1. Load saved auth state.
+  2. Verify the session is still valid.
+  3. Search for each query from config.
+  4. Apply price filters and sort order.
+  5. Collect up to MAX_ITEMS_PER_QUERY listings.
+  6. Add each listing to the cart.
+  7. Return structured results for the Telegram bot to report.
 """
 
 import time
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PWTimeout
@@ -30,6 +48,18 @@ _SORT_PARAM = {
     "rating": "rating",
 }
 
+# Selector that is only present when a user is logged in (account name/avatar)
+_LOGGED_IN_SELECTOR = (
+    "[data-spm='account'], "
+    ".account-name, "
+    "span.name, "
+    "//span[contains(@class,'Username')]"
+)
+
+
+class SessionExpiredError(Exception):
+    """Raised when the saved auth state is no longer valid."""
+
 
 @dataclass
 class ListingResult:
@@ -44,7 +74,6 @@ class ListingResult:
 class ScrapeReport:
     query: str
     listings: list[ListingResult] = field(default_factory=list)
-    login_ok: bool = True
     error: Optional[str] = None
 
 
@@ -63,7 +92,9 @@ class LazadaScraper:
             headless=config.HEADLESS,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        self._context = self._browser.new_context(
+        # Load saved auth state so the session is already authenticated
+        state_path = config.AUTH_STATE_FILE
+        ctx_kwargs = dict(
             viewport={"width": 1280, "height": 800},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -71,6 +102,15 @@ class LazadaScraper:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
+        if Path(state_path).exists():
+            ctx_kwargs["storage_state"] = state_path
+            logger.info("Loaded auth state from %s", state_path)
+        else:
+            logger.warning(
+                "No auth state found at '%s'. Run `python main.py --login` first.",
+                state_path,
+            )
+        self._context = self._browser.new_context(**ctx_kwargs)
         self._page = self._context.new_page()
         logger.info("Browser started (headless=%s)", config.HEADLESS)
 
@@ -90,52 +130,30 @@ class LazadaScraper:
 
     # ── public API ─────────────────────────────────────────────────────────────
 
-    def login(self) -> bool:
-        """Navigate to Lazada and log in. Returns True on success."""
+    def verify_session(self) -> bool:
+        """
+        Navigate to the Lazada homepage and confirm the account widget
+        is visible (i.e. we are logged in).
+
+        Raises SessionExpiredError if the session is invalid so the
+        caller can send an alert rather than scraping as a guest.
+        """
         page = self._page
         try:
-            logger.info("Navigating to %s", config.LAZADA_BASE_URL)
             page.goto(config.LAZADA_BASE_URL, wait_until="domcontentloaded", timeout=30_000)
             self._delay()
-
-            # Click the account / login button
-            login_trigger = page.locator(
-                "//span[contains(@class,'Account') or contains(text(),'Sign in') "
-                "or contains(text(),'Log in')]"
-            ).first
-            if login_trigger.is_visible(timeout=5_000):
-                login_trigger.click()
-                self._delay()
-            else:
-                # Some regions show login page directly
-                page.goto(f"{config.LAZADA_BASE_URL}/customer/account/login/", timeout=30_000)
-                self._delay()
-
-            # Fill credentials
-            page.fill("input[name='loginName'], input[type='email'], #email", config.LAZADA_EMAIL)
-            self._delay(0.5)
-            page.fill("input[name='password'], input[type='password'], #password", config.LAZADA_PASSWORD)
-            self._delay(0.5)
-            page.click("button[type='submit'], .login-button, #login-btn")
-            page.wait_for_load_state("domcontentloaded", timeout=20_000)
-            self._delay()
-
-            # Verify login by checking for account-related element
-            logged_in = page.locator(
-                "//span[contains(@class,'Username') or contains(@class,'account-name')]"
-            ).is_visible(timeout=8_000)
-            if logged_in:
-                logger.info("Login successful")
-            else:
-                logger.warning("Login status uncertain — proceeding anyway")
+            logged_in = page.locator(_LOGGED_IN_SELECTOR).first.is_visible(timeout=6_000)
+            if not logged_in:
+                raise SessionExpiredError(
+                    f"Session in '{config.AUTH_STATE_FILE}' has expired. "
+                    "Run `python main.py --login` to refresh it."
+                )
+            logger.info("Session verified — logged in")
             return True
-
+        except SessionExpiredError:
+            raise
         except PWTimeout:
-            logger.error("Login timed out")
-            return False
-        except Exception as exc:
-            logger.error("Login error: %s", exc)
-            return False
+            raise SessionExpiredError("Timed out checking login status")
 
     def run_query(self, query: str) -> ScrapeReport:
         """Search for *query*, collect listings, add to cart, return report."""
@@ -182,6 +200,62 @@ class LazadaScraper:
 
         return report
 
+    # ── interactive login (run once via --login flag) ──────────────────────────
+
+    @classmethod
+    def interactive_login(cls) -> None:
+        """
+        Open a visible browser, navigate to Lazada, and wait for the user
+        to log in manually. Once the account widget appears the session is
+        saved to AUTH_STATE_FILE automatically.
+
+        This method blocks until login is detected or the user presses
+        Ctrl-C to abort.
+        """
+        save_path = config.AUTH_STATE_FILE
+        print(
+            "\n──────────────────────────────────────────────\n"
+            " ScraperBot – Manual Login\n"
+            "──────────────────────────────────────────────\n"
+            f" 1. A browser window will open on {config.LAZADA_BASE_URL}\n"
+            " 2. Log in as you normally would (OTP / CAPTCHA / etc.).\n"
+            " 3. Once you see your account name in the top bar,\n"
+            "    the bot will save your session automatically.\n"
+            "──────────────────────────────────────────────\n"
+        )
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=False,  # always visible for manual login
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+            page.goto(config.LAZADA_BASE_URL, wait_until="domcontentloaded")
+
+            print("Waiting for you to log in (timeout: 5 minutes)…")
+            try:
+                # Poll every 2 s for up to 5 minutes
+                page.wait_for_selector(
+                    _LOGGED_IN_SELECTOR,
+                    timeout=300_000,  # 5 minutes
+                    state="visible",
+                )
+                print("Login detected! Saving session…")
+                context.storage_state(path=save_path)
+                print(f"Session saved to '{save_path}'. You can close the browser.\n")
+            except PWTimeout:
+                print("Login not detected within 5 minutes — aborting.")
+            finally:
+                browser.close()
+
     # ── helpers ────────────────────────────────────────────────────────────────
 
     def _build_search_url(self, query: str) -> str:
@@ -205,7 +279,7 @@ class LazadaScraper:
             price_text = price_el.inner_text(timeout=3_000).strip()
             url = link_el.get_attribute("href", timeout=3_000)
 
-            # Parse price — strip currency symbols and commas
+            # Strip currency symbols and commas to get a plain float
             price_clean = "".join(c for c in price_text if c.isdigit() or c == ".")
             price = float(price_clean) if price_clean else 0.0
 

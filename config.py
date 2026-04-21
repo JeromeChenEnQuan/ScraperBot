@@ -13,9 +13,11 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID: str = os.environ["TELEGRAM_CHAT_ID"]
 
-# ── Lazada account ────────────────────────────────────────────────────────────
-LAZADA_EMAIL: str = os.environ["LAZADA_EMAIL"]
-LAZADA_PASSWORD: str = os.environ["LAZADA_PASSWORD"]
+# ── Lazada session ────────────────────────────────────────────────────────────
+# Path to the saved browser auth state produced by: python main.py --login
+# No credentials are stored — the user logs in manually once and the session
+# is persisted here (cookies + localStorage).
+AUTH_STATE_FILE: str = os.getenv("AUTH_STATE_FILE", "auth_state.json")
 
 LAZADA_COUNTRY: str = os.getenv("LAZADA_COUNTRY", "sg").lower()
 _COUNTRY_DOMAINS = {

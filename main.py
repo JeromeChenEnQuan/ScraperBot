@@ -1,8 +1,13 @@
 """
 main.py – ScraperBot entry point.
 
-Starts the Telegram bot listener and an APScheduler job that
-runs the Lazada scraper on the interval defined in .env.
+Usage
+-----
+  python main.py           – start the bot (requires a saved session)
+  python main.py --login   – open a browser for manual login, save session
+
+The --login flow must be run at least once before the normal bot can operate.
+Re-run it whenever Lazada logs you out (the bot will send a Telegram alert).
 """
 
 import asyncio
@@ -13,7 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 
 import config
-from scraper.lazada_scraper import LazadaScraper, ScrapeReport
+from scraper.lazada_scraper import LazadaScraper, ScrapeReport, SessionExpiredError
 from bot.telegram_bot import build_app, notify, _fmt_report
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -24,16 +29,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+
 # ── Scrape logic ───────────────────────────────────────────────────────────────
 
 def _run_scrape_sync() -> list[ScrapeReport]:
-    """Blocking scrape. Runs in a thread via asyncio.to_thread."""
+    """Blocking scrape that runs inside asyncio.to_thread."""
     reports: list[ScrapeReport] = []
     with LazadaScraper() as scraper:
-        logged_in = scraper.login()
-        if not logged_in:
-            logger.error("Login failed – skipping scrape cycle")
-            return [ScrapeReport(query="(all)", error="Login failed")]
+        # Verify the saved session is still valid before doing anything
+        scraper.verify_session()
 
         for query in config.SEARCH_QUERIES:
             logger.info("Processing query: %s", query)
@@ -44,21 +48,24 @@ def _run_scrape_sync() -> list[ScrapeReport]:
 
 
 async def run_scrape_and_notify(app_bot_data: dict | None = None) -> list[ScrapeReport]:
-    """
-    Run scrape in a thread, then push Telegram notifications.
-    app_bot_data: bot_data dict from the Application, used to update the
-                  session cart (optional – omitted during scheduled runs
-                  before the bot is initialised).
-    """
+    """Run scrape in a thread, then push Telegram notifications."""
     logger.info("Scrape cycle starting")
-    reports = await asyncio.to_thread(_run_scrape_sync)
 
     bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
     async with bot:
+        try:
+            reports = await asyncio.to_thread(_run_scrape_sync)
+        except SessionExpiredError as exc:
+            logger.error("Session expired: %s", exc)
+            await notify(
+                bot,
+                f"*Session expired*\n{str(exc)}\nRun `python main\\.py \\-\\-login` to refresh\\.",
+            )
+            return []
+
         total_added = 0
         for report in reports:
-            msg = _fmt_report(report)
-            await notify(bot, msg)
+            await notify(bot, _fmt_report(report))
             for item in report.listings:
                 if item.added_to_cart:
                     total_added += 1
@@ -77,22 +84,29 @@ async def run_scrape_and_notify(app_bot_data: dict | None = None) -> list[Scrape
     return reports
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main modes ─────────────────────────────────────────────────────────────────
 
-async def main() -> None:
+def run_login() -> None:
+    """Interactive login mode: open a visible browser and save the session."""
+    LazadaScraper.interactive_login()
+
+
+async def run_bot() -> None:
+    """Normal bot mode: schedule scrapes and listen for Telegram commands."""
     logger.info("ScraperBot starting up")
-    logger.info("Country: %s | Queries: %s | Interval: %d min",
-                config.LAZADA_COUNTRY.upper(),
-                ", ".join(config.SEARCH_QUERIES),
-                config.CHECK_INTERVAL_MINUTES)
+    logger.info(
+        "Country: %s | Queries: %s | Interval: %d min",
+        config.LAZADA_COUNTRY.upper(),
+        ", ".join(config.SEARCH_QUERIES),
+        config.CHECK_INTERVAL_MINUTES,
+    )
 
-    # Build the Telegram application, injecting the scrape function
     async def _trigger_from_command() -> list[ScrapeReport]:
         return await run_scrape_and_notify(app.bot_data)
 
     app = build_app(_trigger_from_command)
 
-    # APScheduler for recurring scrapes
+    # Recurring scrape schedule
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         run_scrape_and_notify,
@@ -104,17 +118,20 @@ async def main() -> None:
     scheduler.start()
     logger.info("Scheduler started – next run in %d minutes", config.CHECK_INTERVAL_MINUTES)
 
-    # Run an immediate scrape on first startup
+    # Immediate scrape on startup
     logger.info("Running initial scrape on startup")
     await run_scrape_and_notify(app.bot_data)
 
-    # Start polling for Telegram commands (blocking)
+    # Block on Telegram polling
     logger.info("Telegram bot polling started – send /help in chat")
     await app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("ScraperBot stopped by user")
+    if "--login" in sys.argv:
+        run_login()
+    else:
+        try:
+            asyncio.run(run_bot())
+        except KeyboardInterrupt:
+            logger.info("ScraperBot stopped by user")
