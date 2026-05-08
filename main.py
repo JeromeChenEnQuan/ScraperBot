@@ -19,7 +19,7 @@ from telegram import Bot
 
 import config
 from scraper.lazada_scraper import LazadaScraper, ScrapeReport, SessionExpiredError
-from bot.telegram_bot import build_app, notify, _fmt_report
+from bot.telegram_bot import build_app, notify, fmt_report
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -65,7 +65,7 @@ async def run_scrape_and_notify(app_bot_data: dict | None = None) -> list[Scrape
 
         total_added = 0
         for report in reports:
-            await notify(bot, _fmt_report(report))
+            await notify(bot, fmt_report(report))
             for item in report.listings:
                 if item.added_to_cart:
                     total_added += 1

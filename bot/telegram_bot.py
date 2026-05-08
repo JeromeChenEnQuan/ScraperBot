@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ── Formatting helpers ─────────────────────────────────────────────────────────
 
-def _fmt_report(report: ScrapeReport) -> str:
+def fmt_report(report: ScrapeReport) -> str:
     lines = [f"*Search: {_esc(report.query)}*"]
     if report.error:
         lines.append(f"Error: {_esc(report.error)}")
@@ -84,10 +84,17 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Starting scrape now\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
-    reports = await ctx.application.bot_data["run_scrape"]()
+    try:
+        reports = await ctx.application.bot_data["run_scrape"]()
+    except Exception as exc:
+        await update.message.reply_text(
+            f"Scrape failed: {_esc(str(exc))}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
     for report in reports:
         await update.message.reply_text(
-            _fmt_report(report),
+            fmt_report(report),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )

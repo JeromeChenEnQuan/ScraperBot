@@ -27,11 +27,12 @@ Responsibilities (normal run)
   7. Return structured results for the Telegram bot to report.
 """
 
-import time
+import re
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote_plus
 
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PWTimeout
 
@@ -49,12 +50,7 @@ _SORT_PARAM = {
 }
 
 # Selector that is only present when a user is logged in (account name/avatar)
-_LOGGED_IN_SELECTOR = (
-    "[data-spm='account'], "
-    ".account-name, "
-    "span.name, "
-    "//span[contains(@class,'Username')]"
-)
+_LOGGED_IN_SELECTOR = "[data-spm='account'], .account-name, span.name"
 
 
 class SessionExpiredError(Exception):
@@ -141,7 +137,7 @@ class LazadaScraper:
         page = self._page
         try:
             page.goto(config.LAZADA_BASE_URL, wait_until="domcontentloaded", timeout=30_000)
-            self._delay()
+            page.wait_for_load_state("networkidle", timeout=10_000)
             logged_in = page.locator(_LOGGED_IN_SELECTOR).first.is_visible(timeout=6_000)
             if not logged_in:
                 raise SessionExpiredError(
@@ -164,10 +160,11 @@ class LazadaScraper:
             search_url = self._build_search_url(query)
             logger.info("Searching: %s", search_url)
             page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-            self._delay()
+            page.wait_for_load_state("networkidle", timeout=10_000)
 
-            # Collect product cards
-            cards = page.locator("[data-qa-locator='product-item'], .Bm3ON, ._95X4G").all()
+            # Wait for product grid to render before collecting cards
+            page.wait_for_selector("[data-qa-locator='product-item']", timeout=15_000)
+            cards = page.locator("[data-qa-locator='product-item']").all()
             logger.info("Found %d product cards for '%s'", len(cards), query)
 
             count = 0
@@ -186,10 +183,9 @@ class LazadaScraper:
                     continue
 
                 # Open product page and add to cart
-                self._add_to_cart(listing)
+                self._add_to_cart(listing, search_url)
                 report.listings.append(listing)
                 count += 1
-                self._delay()
 
         except PWTimeout:
             report.error = f"Timeout while processing query '{query}'"
@@ -260,7 +256,7 @@ class LazadaScraper:
 
     def _build_search_url(self, query: str) -> str:
         sort = _SORT_PARAM.get(config.SORT_BY, "popularity")
-        url = f"{config.LAZADA_BASE_URL}/catalog/?q={query}&sort={sort}"
+        url = f"{config.LAZADA_BASE_URL}/catalog/?q={quote_plus(query)}&sort={sort}"
         if config.MIN_PRICE is not None:
             url += f"&price={int(config.MIN_PRICE)}-"
             if config.MAX_PRICE is not None:
@@ -271,17 +267,16 @@ class LazadaScraper:
 
     def _extract_listing(self, card) -> Optional[ListingResult]:
         try:
-            name_el = card.locator("[data-qa-locator='product-name'], .RfADt, .line-clamp").first
-            price_el = card.locator("[data-qa-locator='product-price'], .ooOxS, .price-box").first
+            name_el = card.locator("[data-qa-locator='product-name']").first
+            price_el = card.locator("[data-qa-locator='product-price']").first
             link_el = card.locator("a[href*='/products/'], a[href*='.html']").first
 
             name = name_el.inner_text(timeout=3_000).strip()
             price_text = price_el.inner_text(timeout=3_000).strip()
             url = link_el.get_attribute("href", timeout=3_000)
 
-            # Strip currency symbols and commas to get a plain float
-            price_clean = "".join(c for c in price_text if c.isdigit() or c == ".")
-            price = float(price_clean) if price_clean else 0.0
+            m = re.search(r"[\d,]+\.?\d*", price_text)
+            price = float(m.group().replace(",", "")) if m else 0.0
 
             if not url.startswith("http"):
                 url = config.LAZADA_BASE_URL + url
@@ -291,26 +286,26 @@ class LazadaScraper:
             logger.debug("Could not extract listing: %s", exc)
             return None
 
-    def _add_to_cart(self, listing: ListingResult) -> None:
+    def _add_to_cart(self, listing: ListingResult, search_url: str) -> None:
         page = self._page
         try:
             logger.info("Opening product: %s", listing.name)
             page.goto(listing.url, wait_until="domcontentloaded", timeout=30_000)
-            self._delay()
+            page.wait_for_load_state("networkidle", timeout=10_000)
 
             # Handle size/variant selectors if present
             variant_btns = page.locator(".sku-variable-img-wrap button:not([disabled])").all()
-            if variant_btns:
+            if variant_btns and variant_btns[0].is_visible():
                 variant_btns[0].click()
-                self._delay(0.5)
+                page.wait_for_load_state("networkidle", timeout=5_000)
 
-            # Click Add to Cart
+            # Wait for Add to Cart button to be visible before clicking
             add_btn = page.locator(
                 "//button[contains(text(),'Add to Cart') or contains(text(),'Add to Bag') "
                 "or @data-qa-locator='add-to-cart']"
             ).first
-            add_btn.click(timeout=8_000)
-            self._delay()
+            add_btn.wait_for(state="visible", timeout=8_000)
+            add_btn.click()
 
             listing.added_to_cart = True
             logger.info("Added to cart: %s", listing.name)
@@ -321,12 +316,9 @@ class LazadaScraper:
             listing.error = str(exc)
             logger.warning("Could not add '%s' to cart: %s", listing.name, exc)
 
-        # Navigate back to search results
+        # Navigate directly back to search results (go_back() can land on cart/confirmation pages)
         try:
-            page.go_back(wait_until="domcontentloaded", timeout=15_000)
-            self._delay()
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+            page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
-
-    def _delay(self, multiplier: float = 1.0) -> None:
-        time.sleep(config.ACTION_DELAY_SECONDS * multiplier)
